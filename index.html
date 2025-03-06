@@ -1,0 +1,2749 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <!-- iOS Web App 配置 -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="奶呼呼">
+    <meta name="format-detection" content="telephone=no">
+    <title>奶呼呼</title>
+    <!-- 添加网站图标引用 -->
+    <link rel="icon" href="favicon.ico" type="image/x-icon">
+    <link rel="shortcut icon" href="favicon.ico" type="image/x-icon">
+    <link rel="apple-touch-icon" href="favicon.ico">
+    <!-- 添加启动画面 -->
+    <link rel="apple-touch-startup-image" href="favicon.ico">
+    <script src="https://cdn.jsdelivr.net/npm/leancloud-storage@4.15.0/dist/av-live-query-min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script type="module">
+        import CloudService from './cloudService.js';
+        
+        // 等待DOM加载完成
+        document.addEventListener('DOMContentLoaded', async () => {
+            try {
+                // 初始化CloudService
+                window.CloudService = await CloudService.initialize();
+                
+                // 添加退出登录函数到全局作用域
+                window.logout = async function() {
+                    try {
+                        CloudService.logout();
+                        // 显示登录面板
+                        document.getElementById('loginPanel').style.display = 'flex';
+                        // 关闭宝宝管理面板
+                        document.getElementById('babyManager').style.display = 'none';
+                        // 清空表单
+                        document.getElementById('username').value = '';
+                        document.getElementById('password').value = '';
+                        // 清空宝宝列表
+                        document.getElementById('babyList').innerHTML = '';
+                        // 清空宝宝选择器
+                        document.getElementById('babySelect').innerHTML = '';
+                        // 重置图表
+                        updateDailyChart();
+                        updateWeeklyChart();
+                    } catch (error) {
+                        alert('退出登录失败，请重试');
+                    }
+                };
+
+                // 以下是原有的初始化代码
+                const loginPanel = document.getElementById('loginPanel');
+                const loginBtn = document.getElementById('loginBtn');
+                const switchMode = document.getElementById('switchMode');
+                const usernameInput = document.getElementById('username');
+                const passwordInput = document.getElementById('password');
+                let isLoginMode = true;
+
+                // 切换登录/注册模式
+                switchMode.addEventListener('click', () => {
+                    isLoginMode = !isLoginMode;
+                    loginBtn.textContent = isLoginMode ? '登录' : '注册';
+                    switchMode.textContent = isLoginMode ? '还没有账号？点击注册' : '已有账号？点击登录';
+                });
+
+                // 处理登录/注册
+                loginBtn.addEventListener('click', async () => {
+                    const username = usernameInput.value.trim();
+                    const password = passwordInput.value.trim();
+
+                    if (!username || !password) {
+                        alert('请输入用户名和密码');
+                        return;
+                    }
+
+                    try {
+                        let result;
+                        if (isLoginMode) {
+                            result = await CloudService.login(username, password);
+                        } else {
+                            result = await CloudService.register(username, password);
+                        }
+
+                        if (result.success) {
+                            loginPanel.style.display = 'none';
+                            initializeApp(); // 初始化应用
+                        } else {
+                            alert(result.error);
+                        }
+                    } catch (error) {
+                        alert('操作失败，请重试');
+                    }
+                });
+
+                // 检查是否已登录
+                const currentUser = CloudService.getCurrentUser();
+                console.log('检查登录状态:', currentUser ? '已登录' : '未登录');
+                if (currentUser) {
+                    loginPanel.style.display = 'none';
+                    initializeApp();
+                } else {
+                    console.log('用户未登录，显示登录界面');
+                    // 确保登录面板可见
+                    loginPanel.style.display = 'flex';
+                }
+
+                // 原有的应用代码
+                let currentBaby = '';
+                let babies = [];
+                let records = [];
+                // 设置默认奶量，后续会从云端获取
+                let currentMilkAmount = 30;
+                let sleepStartTime = null;
+                let dailyChart = null;
+                let weeklyChart = null;
+
+                // 修改数据保存函数
+                async function saveRecords() {
+                    try {
+                        document.getElementById('syncStatus').textContent = '同步状态: 同步中...';
+                        for (const record of records) {
+                            if (!record.synced) {
+                                const result = await CloudService.saveRecord({
+                                    ...record,
+                                    babyId: currentBaby
+                                });
+                                if (result.success) {
+                                    record.synced = true;
+                                }
+                            }
+                        }
+                        document.getElementById('syncStatus').textContent = '同步状态: 已同步';
+                    } catch (error) {
+                        document.getElementById('syncStatus').textContent = '同步状态: 同步失败';
+                    }
+                }
+
+                // 修改宝宝保存函数
+                async function saveBaby(baby) {
+                    try {
+                        const result = await CloudService.saveBabyData(baby);
+                        return result.success;
+                    } catch (error) {
+                        return false;
+                    }
+                }
+
+                // 修改初始化函数
+                async function initializeApp() {
+                    console.log('开始初始化应用');
+                    document.getElementById('syncStatus').textContent = '同步状态: 正在加载...';
+                    
+                    try {
+                        // 先检查用户是否真的登录了
+                        const currentUser = CloudService.getCurrentUser();
+                        if (!currentUser) {
+                            console.error('初始化应用时发现用户未登录');
+                            document.getElementById('loginPanel').style.display = 'flex';
+                            document.getElementById('syncStatus').textContent = '同步状态: 请先登录';
+                            return;
+                        }
+                        
+                        console.log('用户已登录:', currentUser.getUsername(), '开始加载设置和宝宝数据');
+                        
+                        // 首先尝试从localStorage加载设置作为备份
+                        try {
+                            const savedMilkAmount = localStorage.getItem('milkAmount');
+                            if (savedMilkAmount) {
+                                currentMilkAmount = parseInt(savedMilkAmount);
+                                console.log('从localStorage获取奶量设置:', currentMilkAmount);
+                            }
+                        } catch (localError) {
+                            console.error('从localStorage获取设置失败:', localError);
+                        }
+                        
+                        // 然后尝试从云端获取设置（优先级更高）
+                        try {
+                            console.log('尝试从云端获取用户设置...');
+                            const settingsResult = await CloudService.getUserSettings();
+                            console.log('云端设置获取结果:', settingsResult);
+                            
+                            if (settingsResult.success && settingsResult.settings) {
+                                if (settingsResult.settings.milkAmount) {
+                                    currentMilkAmount = parseInt(settingsResult.settings.milkAmount);
+                                    console.log('从云端获取奶量设置:', currentMilkAmount);
+                                    // 同步到localStorage作为备份
+                                    localStorage.setItem('milkAmount', currentMilkAmount.toString());
+                                }
+                            } else {
+                                console.log('云端获取设置失败:', settingsResult.error);
+                                
+                                // 如果是因为登录过期导致的获取失败，提示用户重新登录
+                                if (settingsResult.error && (settingsResult.error.includes('登录已过期') || settingsResult.error.includes('请先登录'))) {
+                                    console.warn('用户会话已过期，需要重新登录');
+                                    alert('您的登录已过期，请重新登录');
+                                    document.getElementById('loginPanel').style.display = 'flex';
+                                    document.getElementById('syncStatus').textContent = '同步状态: 请重新登录';
+                                    return;
+                                }
+                            }
+                        } catch (settingsError) {
+                            console.error('获取云端设置出错:', settingsError);
+                        }
+                        
+                        // 获取宝宝列表
+                        try {
+                            console.log('尝试获取宝宝列表...');
+                        const result = await CloudService.getBabies();
+                            console.log('宝宝列表获取结果:', result);
+                            
+                        if (result.success) {
+                            babies = result.babies;
+                                console.log('成功获取宝宝列表，数量:', babies.length);
+                                
+                            if (babies.length > 0) {
+                                currentBaby = babies[0].id;
+                                    console.log('设置当前宝宝ID:', currentBaby);
+                                    
+                                    // 获取记录
+                                    try {
+                                        console.log('尝试获取当前宝宝的记录...');
+                                const recordsResult = await CloudService.getRecords(currentBaby);
+                                        console.log('记录获取结果:', recordsResult);
+                                        
+                                if (recordsResult.success) {
+                                    records = recordsResult.records;
+                                            console.log('成功获取记录，数量:', records.length);
+                                            
+                                    // 检查是否有未结束的睡眠记录
+                                    const lastSleepRecord = records
+                                        .filter(r => r.type === 'sleep')
+                                        .sort((a, b) => new Date(b.time) - new Date(a.time))[0];
+                                    
+                                    if (lastSleepRecord && !lastSleepRecord.end) {
+                                        sleepStartTime = new Date(lastSleepRecord.start);
+                                                console.log('检测到未结束的睡眠记录，开始时间:', sleepStartTime);
+                                                // 更新按钮状态 - 修改为显示睡醒按钮，隐藏入睡按钮
+                                                toggleSleepButtons(true);
+                                            } else {
+                                                // 没有未结束的睡眠，显示入睡按钮
+                                                toggleSleepButtons(false);
+                                            }
+                                        } else {
+                                            console.error('获取记录失败:', recordsResult.error);
+                                            
+                                            // 如果是因为登录过期导致的获取失败，提示用户重新登录
+                                            if (recordsResult.error && (recordsResult.error.includes('登录已过期') || recordsResult.error.includes('请先登录'))) {
+                                                console.warn('用户会话已过期，需要重新登录');
+                                                alert('您的登录已过期，请重新登录');
+                                                document.getElementById('loginPanel').style.display = 'flex';
+                                                document.getElementById('syncStatus').textContent = '同步状态: 请重新登录';
+                                                return;
+                                            }
+                                        }
+                                    } catch (recordsError) {
+                                        console.error('获取记录时出错:', recordsError);
+                                    }
+                                } else {
+                                    console.log('没有宝宝数据，显示宝宝管理面板');
+                                }
+                            } else {
+                                console.error('获取宝宝列表失败:', result.error);
+                                
+                                // 如果是因为登录过期导致的获取失败，提示用户重新登录
+                                if (result.error && (result.error.includes('登录已过期') || result.error.includes('请先登录'))) {
+                                    console.warn('用户会话已过期，需要重新登录');
+                                    alert('您的登录已过期，请重新登录');
+                                    document.getElementById('loginPanel').style.display = 'flex';
+                                    document.getElementById('syncStatus').textContent = '同步状态: 请重新登录';
+                                    return;
+                                }
+                            }
+                        } catch (babiesError) {
+                            console.error('获取宝宝列表时出错:', babiesError);
+                        }
+                        
+                        // 更新同步状态
+                        document.getElementById('syncStatus').textContent = '同步状态: 已同步';
+                    } catch (error) {
+                        console.error('初始化应用失败:', error);
+                        document.getElementById('syncStatus').textContent = '同步状态: 加载失败';
+                    }
+
+                    // 根据宝宝列表决定是否显示宝宝管理面板
+                    if (babies.length === 0) {
+                        babyManager.style.display = 'block';
+                    } else {
+                        babyManager.style.display = 'none';
+                    }
+                    
+                    // 初始化界面
+                    try {
+                        console.log('初始化用户界面...');
+                    initBabySelector();
+                    updateInfoPanel();
+                    updateDailyChart();
+                    updateWeeklyChart();
+                    setInterval(updateInfoPanel, 1000);
+                        console.log('界面初始化完成');
+                    } catch (uiError) {
+                        console.error('初始化界面失败:', uiError);
+                    }
+
+                    // 设置实时同步
+                    try {
+                        console.log('设置实时同步...');
+                        // 监听记录变化
+                        await CloudService.setupLiveQuery(
+                            // 新记录创建
+                            (newRecord) => {
+                                if (newRecord.babyId === currentBaby) {
+                                    console.log('接收到新记录:', newRecord);
+                                    records.push(newRecord);
+                                    updateInfoPanel();
+                                    updateDailyChart();
+                                    updateWeeklyChart();
+                                }
+                            },
+                            // 记录更新
+                            (updatedRecord) => {
+                                if (updatedRecord.babyId === currentBaby) {
+                                    console.log('接收到记录更新:', updatedRecord);
+                                    const index = records.findIndex(r => r.id === updatedRecord.id);
+                                    if (index !== -1) {
+                                        records[index] = updatedRecord;
+                                        updateInfoPanel();
+                                        updateDailyChart();
+                                        updateWeeklyChart();
+                                    }
+                                }
+                            },
+                            // 记录删除
+                            (deletedRecordId) => {
+                                console.log('接收到记录删除通知:', deletedRecordId);
+                                records = records.filter(r => r.id !== deletedRecordId);
+                                updateInfoPanel();
+                                updateDailyChart();
+                                updateWeeklyChart();
+                            }
+                        );
+
+                        // 监听宝宝信息变化
+                        await CloudService.setupBabyLiveQuery(
+                            // 新宝宝创建
+                            (newBaby) => {
+                                console.log('接收到新宝宝创建:', newBaby);
+                                babies.push(newBaby);
+                                updateBabyList();
+                                initBabySelector();
+                            },
+                            // 宝宝信息更新
+                            (updatedBaby) => {
+                                console.log('接收到宝宝信息更新:', updatedBaby);
+                                const index = babies.findIndex(b => b.id === updatedBaby.id);
+                                if (index !== -1) {
+                                    babies[index] = updatedBaby;
+                                    updateBabyList();
+                                    initBabySelector();
+                                    updateInfoPanel();
+                                }
+                            },
+                            // 宝宝删除
+                            (deletedBabyId) => {
+                                console.log('接收到宝宝删除通知:', deletedBabyId);
+                                babies = babies.filter(b => b.id !== deletedBabyId);
+                                if (currentBaby === deletedBabyId) {
+                                    currentBaby = babies[0]?.id || '';
+                                    records = [];
+                                    updateInfoPanel();
+                                    updateDailyChart();
+                                    updateWeeklyChart();
+                                }
+                                updateBabyList();
+                                initBabySelector();
+                            }
+                        );
+                        console.log('实时同步设置完成');
+                    } catch (error) {
+                        console.error('设置实时同步失败:', error);
+                    }
+                }
+
+                // 修改添加宝宝函数
+                window.addBaby = async function() {
+                    const input = document.getElementById('newBabyName');
+                    const birthdayInput = document.getElementById('newBabyBirthday');
+                    const name = input.value.trim();
+                    const birthday = birthdayInput.value;
+                    
+                    if (!name || !birthday) {
+                        alert('请填写完整信息');
+                        return;
+                    }
+
+                    try {
+                        console.log('准备添加宝宝:', { name, birthday });
+                        
+                        const newBaby = {
+                            id: Date.now().toString(),
+                            name,
+                            birthday
+                        };
+
+                        console.log('开始保存宝宝数据:', newBaby);
+                        const result = await CloudService.saveBabyData(newBaby);
+                        console.log('保存结果:', result);
+
+                        if (result.success) {
+                            babies.push(newBaby);
+                            if (!currentBaby) {
+                                currentBaby = newBaby.id;
+                                records = [];
+                            }
+                            input.value = '';
+                            birthdayInput.value = '';
+                            updateBabyList();
+                            initBabySelector();
+                            updateInfoPanel();
+                            // 关闭宝宝管理面板
+                            document.getElementById('babyManager').style.display = 'none';
+                        } else {
+                            alert(result.error || '保存失败，请重试');
+                        }
+                    } catch (error) {
+                        console.error('添加宝宝失败:', error);
+                        alert('添加失败：' + (error.message || '未知错误'));
+                    }
+                };
+
+                // 添加更新宝宝列表函数
+                window.updateBabyList = function() {
+                    const babyList = document.getElementById('babyList');
+                    babyList.innerHTML = '';
+                    babies.forEach(baby => {
+                        const div = document.createElement('div');
+                        div.className = 'baby-item';
+                        div.innerHTML = `
+                            <div>
+                                <strong>${baby.name}</strong><br>
+                                <small>生日: ${baby.birthday}</small>
+                            </div>
+                            <button onclick="deleteBaby('${baby.id}')" class="milk-adjust-btn" style="background: #ff6b6b;">删除</button>
+                        `;
+                        babyList.appendChild(div);
+                    });
+                };
+
+                // 添加初始化宝宝选择器函数
+                window.initBabySelector = function() {
+                    const babySelect = document.getElementById('babySelect');
+                    babySelect.innerHTML = '';
+                    babies.forEach(baby => {
+                        const option = document.createElement('option');
+                        option.value = baby.id;
+                        option.textContent = baby.name;
+                        babySelect.appendChild(option);
+                    });
+                    if (currentBaby) {
+                        babySelect.value = currentBaby;
+                    }
+                };
+
+                // 添加关闭宝宝管理面板函数
+                window.closeBabyManager = function() {
+                    document.getElementById('babyManager').style.display = 'none';
+                };
+
+                // 添加打开宝宝管理面板事件监听
+                document.getElementById('manageBabiesBtn').addEventListener('click', () => {
+                    document.getElementById('babyManager').style.display = 'block';
+                    updateBabyList();
+                });
+
+                // 修改删除宝宝函数
+                window.deleteBaby = async function(id) {
+                    if (confirm('确定要删除这个宝宝的所有记录吗？')) {
+                        try {
+                            const result = await CloudService.deleteBaby(id);
+                            if (result.success) {
+                                babies = babies.filter(baby => baby.id !== id);
+                                if (currentBaby === id) {
+                                    currentBaby = babies[0]?.id || '';
+                                    if (currentBaby) {
+                                        const recordsResult = await CloudService.getRecords(currentBaby);
+                                        if (recordsResult.success) {
+                                            records = recordsResult.records;
+                                        }
+                                    } else {
+                                        records = [];
+                                    }
+                                    updateInfoPanel();
+                                    updateDailyChart();
+                                    updateWeeklyChart();
+                                }
+                                updateBabyList();
+                                initBabySelector();
+                            } else {
+                                alert('删除失败，请重试');
+                            }
+                        } catch (error) {
+                            alert('删除失败，请重试');
+                        }
+                    }
+                };
+
+                // 修改切换宝宝函数
+                babySelect.addEventListener('change', async () => {
+                    currentBaby = babySelect.value;
+                    try {
+                        const result = await CloudService.getRecords(currentBaby);
+                        if (result.success) {
+                            records = result.records;
+                            updateInfoPanel();
+                            updateDailyChart();
+                            updateWeeklyChart();
+                        }
+                    } catch (error) {
+                        alert('获取记录失败，请重试');
+                    }
+                });
+
+                // 添加更新信息面板函数
+                window.updateInfoPanel = function() {
+                    if (!currentBaby) return;
+
+                    const currentBabyData = babies.find(b => b.id === currentBaby);
+                    if (!currentBabyData) return;
+
+                    const ageInMonths = getBabyAgeInMonths(currentBabyData.birthday);
+                    const recommendedFeedingInterval = getRecommendedFeedingInterval(ageInMonths);
+                    const recommendedSleepHours = getRecommendedSleepHours(ageInMonths);
+
+                    // 更新喂奶信息
+                    const lastMilkRecord = records
+                        .filter(r => r.type === 'milk')
+                        .sort((a, b) => new Date(b.time) - new Date(a.time))[0];
+                    
+                    const lastMilkTimeElement = document.getElementById('lastMilkTime');
+                    const milkProgressBar = document.getElementById('milkProgress');
+                    const milkTip = document.getElementById('milkTip');
+                    
+                    if (lastMilkRecord) {
+                        const lastMilkTime = new Date(lastMilkRecord.time);
+                        const now = new Date();
+                        const diff = now - lastMilkTime;
+                        const hours = Math.floor(diff / (1000 * 60 * 60));
+                        const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+                        const seconds = Math.floor((diff % (1000 * 60)) / 1000);
+                        
+                        // 更新时间显示
+                        lastMilkTimeElement.textContent = `${hours}小时${minutes}分钟${seconds}秒`;
+                        
+                        // 更新进度条
+                        const progressPercent = Math.min(100, (diff / (recommendedFeedingInterval * 60 * 1000)) * 100);
+                        milkProgressBar.style.width = `${progressPercent}%`;
+                        
+                        // 更新提示
+                        milkTip.textContent = getMilkTip(ageInMonths, diff);
+                    } else {
+                        lastMilkTimeElement.textContent = '--';
+                        milkProgressBar.style.width = '0%';
+                        milkTip.textContent = '暂无喂奶记录';
+                    }
+
+                    // 更新睡眠信息
+                    const today = new Date();
+                    today.setHours(0, 0, 0, 0);
+                    const todaySleepRecords = records
+                        .filter(r => r.type === 'sleep' && new Date(r.end) > today);
+                    
+                    const todaySleepTimeElement = document.getElementById('todaySleepTime');
+                    const sleepProgressBar = document.getElementById('sleepProgress');
+                    const sleepTip = document.getElementById('sleepTip');
+                    
+                    let totalSleepSeconds = todaySleepRecords.reduce((total, record) => {
+                        return total + record.duration * 60;
+                    }, 0);
+
+                    if (sleepStartTime) {
+                        const currentSleepSeconds = Math.round((new Date() - sleepStartTime) / 1000);
+                        totalSleepSeconds += currentSleepSeconds;
+                    }
+
+                    const totalSleepHours = totalSleepSeconds / 3600;
+                    const hours = Math.floor(totalSleepSeconds / 3600);
+                    const minutes = Math.floor((totalSleepSeconds % 3600) / 60);
+                    const seconds = totalSleepSeconds % 60;
+                    
+                    // 更新时间显示
+                    todaySleepTimeElement.textContent = `${hours}小时${minutes}分钟${seconds}秒`;
+                    
+                    // 更新进度条
+                    const sleepProgressPercent = Math.min(100, (totalSleepHours / recommendedSleepHours) * 100);
+                    sleepProgressBar.style.width = `${sleepProgressPercent}%`;
+                    
+                    // 更新提示
+                    sleepTip.textContent = getSleepTip(ageInMonths, totalSleepHours);
+
+                    // 更新睡眠按钮状态
+                    toggleSleepButtons(!!sleepStartTime);
+
+                    // 更新宝宝年龄显示
+                    if (currentBabyData) {
+                        const birthday = new Date(currentBabyData.birthday);
+                        const now = new Date();
+                        const ageInDays = Math.floor((now - birthday) / (1000 * 60 * 60 * 24));
+                        const months = Math.floor(ageInDays / 30);
+                        const days = ageInDays % 30;
+                        document.getElementById('babyAge').textContent = 
+                            `年龄：${months}个月${days}天`;
+                    }
+                };
+
+                // 添加切换睡眠按钮的函数
+                function toggleSleepButtons(isSleeping) {
+                    // 此函数用于控制睡眠按钮的切换
+                    // isSleeping=true: 显示睡醒按钮, 隐藏入睡按钮
+                    // isSleeping=false: 显示入睡按钮, 隐藏睡醒按钮
+                    const sleepStartButton = document.getElementById('sleepStartButton');
+                    const sleepEndButton = document.getElementById('sleepEndButton');
+                    
+                    if (isSleeping) {
+                        // 已经入睡，显示睡醒按钮，隐藏入睡按钮
+                        sleepStartButton.style.opacity = '0';
+                        sleepStartButton.style.zIndex = '1';
+                        sleepStartButton.disabled = true;
+                        
+                        sleepEndButton.style.opacity = '1';
+                        sleepEndButton.style.zIndex = '2';
+                        sleepEndButton.disabled = false;
+                    } else {
+                        // 未入睡，显示入睡按钮，隐藏睡醒按钮
+                        sleepStartButton.style.opacity = '1';
+                        sleepStartButton.style.zIndex = '2';
+                        sleepStartButton.disabled = false;
+                        
+                        sleepEndButton.style.opacity = '0';
+                        sleepEndButton.style.zIndex = '1';
+                        sleepEndButton.disabled = true;
+                    }
+                }
+
+                // 添加图表更新函数
+                window.updateDailyChart = function() {
+                    const ctx = document.getElementById('dailyChart').getContext('2d');
+                    if (dailyChart) {
+                        dailyChart.destroy();
+                    }
+
+                    const today = new Date();
+                    today.setHours(0, 0, 0, 0);
+                    const todayMilkRecords = records
+                        .filter(r => r.type === 'milk' && new Date(r.time) > today)
+                        .sort((a, b) => new Date(a.time) - new Date(b.time));
+
+                    const data = {
+                        labels: todayMilkRecords.map(r => new Date(r.time).toLocaleTimeString()),
+                        datasets: [{
+                            label: '奶量(ml)',
+                            data: todayMilkRecords.map(r => r.amount),
+                            backgroundColor: 'rgba(142, 197, 211, 0.5)',
+                            borderColor: 'rgba(142, 197, 211, 1)',
+                            borderWidth: 1
+                        }]
+                    };
+
+                    dailyChart = new Chart(ctx, {
+                        type: 'bar',
+                        data: data,
+                        options: {
+                            responsive: true,
+                            scales: {
+                                y: {
+                                    beginAtZero: true
+                                }
+                            }
+                        }
+                    });
+                };
+
+                window.updateWeeklyChart = function() {
+                    const weeklyMilkCanvas = document.getElementById('weeklyMilkChart');
+                    const weeklySleepCanvas = document.getElementById('weeklySleepChart');
+                    
+                    // 获取过去7天的数据
+                    const dates = [];
+                    const now = new Date();
+                    for (let i = 6; i >= 0; i--) {
+                        const date = new Date(now);
+                        date.setDate(date.getDate() - i);
+                        date.setHours(0, 0, 0, 0);
+                        dates.push(date);
+                    }
+
+                    // 处理奶量数据
+                    const milkData = dates.map(date => {
+                        const nextDate = new Date(date);
+                        nextDate.setDate(date.getDate() + 1);
+                        return records
+                            .filter(r => r.type === 'milk' && 
+                                new Date(r.time) >= date && 
+                                new Date(r.time) < nextDate)
+                            .reduce((sum, r) => sum + r.amount, 0);
+                    });
+
+                    // 处理睡眠数据
+                    const sleepData = dates.map(date => {
+                        const nextDate = new Date(date);
+                        nextDate.setDate(date.getDate() + 1);
+                        return records
+                            .filter(r => r.type === 'sleep' && 
+                                new Date(r.end) >= date && 
+                                new Date(r.start) < nextDate)
+                            .reduce((sum, r) => sum + r.duration, 0) / 60; // 转换为小时
+                    });
+
+                    // 创建奶量图表
+                    const milkCtx = weeklyMilkCanvas.getContext('2d');
+                    if (milkCtx.chart) {
+                        milkCtx.chart.destroy();
+                    }
+                    milkCtx.chart = new Chart(milkCtx, {
+                        type: 'bar',
+                        data: {
+                            labels: dates.map(d => d.toLocaleDateString()),
+                            datasets: [{
+                                label: '奶量',
+                                data: milkData,
+                                backgroundColor: 'rgba(142, 197, 211, 0.5)',
+                                borderColor: 'rgba(142, 197, 211, 1)',
+                                borderWidth: 1
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            plugins: {
+                                title: {
+                                    display: true,
+                                    text: '一周奶量'
+                                }
+                            },
+                            scales: {
+                                y: {
+                                    beginAtZero: true,
+                                    title: {
+                                        display: true,
+                                        text: '毫升(ml)'
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    // 创建睡眠图表
+                    const sleepCtx = weeklySleepCanvas.getContext('2d');
+                    if (sleepCtx.chart) {
+                        sleepCtx.chart.destroy();
+                    }
+                    sleepCtx.chart = new Chart(sleepCtx, {
+                        type: 'bar',
+                        data: {
+                            labels: dates.map(d => d.toLocaleDateString()),
+                            datasets: [{
+                                label: '睡眠时间',
+                                data: sleepData,
+                                backgroundColor: 'rgba(216, 191, 216, 0.5)',
+                                borderColor: 'rgba(216, 191, 216, 1)',
+                                borderWidth: 1
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            plugins: {
+                                title: {
+                                    display: true,
+                                    text: '一周睡眠'
+                                }
+                            },
+                            scales: {
+                                y: {
+                                    beginAtZero: true,
+                                    title: {
+                                        display: true,
+                                        text: '小时'
+                                    }
+                                }
+                            }
+                        }
+                    });
+                };
+
+                // 添加图表切换事件监听
+                document.getElementById('dailyChartTab').addEventListener('click', function() {
+                    this.classList.add('active');
+                    document.getElementById('weeklyMilkTab').classList.remove('active');
+                    document.getElementById('weeklySleepTab').classList.remove('active');
+                    document.getElementById('dailyChart').style.display = 'block';
+                    document.getElementById('weeklyMilkChart').style.display = 'none';
+                    document.getElementById('weeklySleepChart').style.display = 'none';
+                });
+
+                document.getElementById('weeklyMilkTab').addEventListener('click', function() {
+                    this.classList.add('active');
+                    document.getElementById('dailyChartTab').classList.remove('active');
+                    document.getElementById('weeklySleepTab').classList.remove('active');
+                    document.getElementById('dailyChart').style.display = 'none';
+                    document.getElementById('weeklyMilkChart').style.display = 'block';
+                    document.getElementById('weeklySleepChart').style.display = 'none';
+                });
+
+                document.getElementById('weeklySleepTab').addEventListener('click', function() {
+                    this.classList.add('active');
+                    document.getElementById('dailyChartTab').classList.remove('active');
+                    document.getElementById('weeklyMilkTab').classList.remove('active');
+                    document.getElementById('dailyChart').style.display = 'none';
+                    document.getElementById('weeklyMilkChart').style.display = 'none';
+                    document.getElementById('weeklySleepChart').style.display = 'block';
+                });
+
+                // 添加按钮事件监听
+                const milkButton = document.getElementById('milkButton');
+                const sleepStartButton = document.getElementById('sleepStartButton');
+                const sleepEndButton = document.getElementById('sleepEndButton');
+                const milkAdjustBtn = document.getElementById('milkAdjustBtn');
+                const historyBtn = document.getElementById('historyBtn');
+                const settings = document.getElementById('settings');
+                const saveSettingsBtn = document.getElementById('saveSettingsBtn');
+                const historyPanel = document.getElementById('historyPanel');
+                const historyClose = document.getElementById('historyClose');
+                const selectAll = document.getElementById('selectAll');
+                const exportBtn = document.getElementById('exportBtn');
+                const deleteSelectedBtn = document.getElementById('deleteSelectedBtn');
+
+                // 喂奶按钮点击事件
+                milkButton.addEventListener('click', async () => {
+                    if (!currentBaby) {
+                        alert('请先添加宝宝信息');
+                        return;
+                    }
+
+                    const record = {
+                        type: 'milk',
+                        time: new Date().toISOString(),
+                        amount: currentMilkAmount
+                    };
+
+                    try {
+                        const result = await CloudService.saveRecord({
+                            ...record,
+                            babyId: currentBaby
+                        });
+
+                        if (result.success) {
+                            records.push(record);
+                            updateInfoPanel();
+                            updateDailyChart();
+                            updateWeeklyChart();
+                        } else {
+                            alert('保存失败，请重试');
+                        }
+                    } catch (error) {
+                        alert('保存失败，请重试');
+                    }
+                });
+
+                // 修改入睡按钮点击事件
+                sleepStartButton.addEventListener('click', async () => {
+                    if (!currentBaby) {
+                        alert('请先添加宝宝信息');
+                        return;
+                    }
+
+                    if (sleepStartTime) {
+                        alert('宝宝已经在睡觉了');
+                        return;
+                    }
+
+                    sleepStartTime = new Date();
+                    const record = {
+                        type: 'sleep',
+                        start: sleepStartTime.toISOString(),
+                        time: sleepStartTime.toISOString()
+                    };
+
+                    try {
+                        const result = await CloudService.saveRecord({
+                            ...record,
+                            babyId: currentBaby
+                        });
+
+                        if (result.success) {
+                            records.push(record);
+                            // 切换按钮状态
+                            toggleSleepButtons(true);
+                            updateInfoPanel();
+                        } else {
+                            alert('保存失败，请重试');
+                            sleepStartTime = null;
+                        }
+                    } catch (error) {
+                        alert('保存失败，请重试');
+                        sleepStartTime = null;
+                    }
+                });
+
+                // 修改睡醒按钮点击事件
+                sleepEndButton.addEventListener('click', async () => {
+                    if (!currentBaby) {
+                        alert('请先添加宝宝信息');
+                        return;
+                    }
+
+                    if (!sleepStartTime) {
+                        alert('请先记录入睡时间');
+                        return;
+                    }
+
+                    const endTime = new Date();
+                    const duration = Math.round((endTime - sleepStartTime) / (1000 * 60)); // 转换为分钟
+
+                    // 查找未结束的睡眠记录
+                    const unfinishedSleepRecord = records
+                        .filter(r => r.type === 'sleep' && !r.end)
+                        .sort((a, b) => new Date(b.time) - new Date(a.time))[0];
+
+                    if (unfinishedSleepRecord) {
+                        try {
+                            const result = await CloudService.updateSleepRecord({
+                                ...unfinishedSleepRecord,
+                                end: endTime.toISOString(),
+                                duration: duration,
+                                babyId: currentBaby
+                            });
+
+                            if (result.success) {
+                                // 更新本地记录
+                                records = records.map(r => {
+                                    if (r === unfinishedSleepRecord) {
+                                        return {
+                                            ...r,
+                                            end: endTime.toISOString(),
+                                            duration: duration
+                                        };
+                                    }
+                                    return r;
+                                });
+                                
+                                sleepStartTime = null;
+                                // 切换按钮状态
+                                toggleSleepButtons(false);
+                                updateInfoPanel();
+                                updateWeeklyChart();
+                            } else {
+                                alert('保存失败，请重试');
+                            }
+                        } catch (error) {
+                            alert('保存失败，请重试');
+                        }
+                    } else {
+                        alert('未找到进行中的睡眠记录');
+                    }
+                });
+
+                // 奶量修改按钮点击事件
+                milkAdjustBtn.addEventListener('click', () => {
+                    document.getElementById('milkAmount').value = currentMilkAmount;
+                    settings.style.display = 'block';
+                });
+
+                // 保存奶量设置
+                saveSettingsBtn.addEventListener('click', async () => {
+                    const amount = parseInt(document.getElementById('milkAmount').value);
+                    if (amount >= 10) {
+                        currentMilkAmount = amount;
+                        
+                        // 首先保存到本地存储作为可靠的备份
+                        try {
+                            localStorage.setItem('milkAmount', amount.toString());
+                            console.log('奶量设置已保存到本地存储:', amount);
+                        } catch (localError) {
+                            console.error('保存到本地存储失败:', localError);
+                        }
+                        
+                        // 然后尝试保存到云端
+                        try {
+                            document.getElementById('syncStatus').textContent = '同步状态: 保存设置中...';
+                            const result = await CloudService.saveUserSettings({ milkAmount: amount });
+                            console.log('云端保存结果:', result);
+                            
+                            if (result.success) {
+                                console.log('奶量设置已成功保存到云端');
+                                document.getElementById('syncStatus').textContent = '同步状态: 已同步';
+                            } else {
+                                console.error('保存设置到云端失败:', result.error);
+                                document.getElementById('syncStatus').textContent = '同步状态: 设置同步失败 (已保存到本地)';
+                                
+                                // 如果是因为未登录或会话过期导致的保存失败，提示用户重新登录
+                                if (result.error && (result.error.includes('登录已过期') || result.error.includes('请先登录'))) {
+                                    alert('您的登录已过期，请重新登录。您的设置已保存在本地。');
+                                    // 显示登录面板
+                                    document.getElementById('loginPanel').style.display = 'flex';
+                                }
+                            }
+                        } catch (error) {
+                            console.error('保存设置到云端出错:', error);
+                            document.getElementById('syncStatus').textContent = '同步状态: 设置同步失败 (已保存到本地)';
+                        }
+                        
+                        settings.style.display = 'none';
+                    } else {
+                        alert('请输入有效的奶量（至少10ml）');
+                    }
+                });
+
+                // 历史记录按钮点击事件
+                historyBtn.addEventListener('click', () => {
+                    updateHistoryTable('milk');
+                    historyPanel.style.display = 'block';
+                });
+
+                // 关闭历史记录面板
+                historyClose.addEventListener('click', () => {
+                    historyPanel.style.display = 'none';
+                });
+
+                // 历史记录类型切换
+                document.querySelectorAll('.history-tab').forEach(tab => {
+                    tab.addEventListener('click', function() {
+                        document.querySelectorAll('.history-tab').forEach(t => t.classList.remove('active'));
+                        this.classList.add('active');
+                        updateHistoryTable(this.dataset.type);
+                    });
+                });
+
+                // 更新历史记录表格
+                function updateHistoryTable(type) {
+                    const tbody = document.getElementById('historyTableBody');
+                    tbody.innerHTML = '';
+                    
+                    const filteredRecords = records
+                        .filter(r => r.type === type)
+                        .sort((a, b) => new Date(b.time) - new Date(a.time));
+
+                    console.log('过滤后的记录:', filteredRecords);
+
+                    filteredRecords.forEach(record => {
+                        // 确保记录有ID
+                        if (!record.id) {
+                            console.warn('记录缺少ID:', record);
+                            return;
+                        }
+
+                        const tr = document.createElement('tr');
+                        
+                        // 创建复选框单元格
+                        const checkboxCell = document.createElement('td');
+                        checkboxCell.className = 'checkbox-cell';
+                        const checkbox = document.createElement('input');
+                        checkbox.type = 'checkbox';
+                        checkbox.value = record.id;
+                        checkboxCell.appendChild(checkbox);
+                        tr.appendChild(checkboxCell);
+                        
+                        // 创建时间单元格
+                        const timeCell = document.createElement('td');
+                        timeCell.textContent = new Date(record.time).toLocaleString();
+                        tr.appendChild(timeCell);
+                        
+                        // 创建数据单元格
+                        const dataCell = document.createElement('td');
+                        if (type === 'milk') {
+                            dataCell.textContent = `${record.amount}ml`;
+                        } else {
+                            dataCell.textContent = `${Math.floor(record.duration / 60)}小时${record.duration % 60}分钟`;
+                        }
+                        tr.appendChild(dataCell);
+                        
+                        // 创建操作单元格
+                        const actionCell = document.createElement('td');
+                        
+                        // 创建编辑按钮
+                        const editBtn = document.createElement('button');
+                        editBtn.className = 'milk-adjust-btn';
+                        editBtn.style.background = '#8EC5D3';
+                        editBtn.style.marginRight = '5px';
+                        editBtn.textContent = '编辑';
+                        editBtn.addEventListener('click', function() {
+                            editRecord(record.id);
+                        });
+                        actionCell.appendChild(editBtn);
+                        
+                        // 创建删除按钮
+                        const deleteBtn = document.createElement('button');
+                        deleteBtn.className = 'milk-adjust-btn';
+                        deleteBtn.style.background = '#ff6b6b';
+                        deleteBtn.textContent = '删除';
+                        deleteBtn.addEventListener('click', function() {
+                            deleteRecord(record.id);
+                        });
+                        actionCell.appendChild(deleteBtn);
+                        
+                        tr.appendChild(actionCell);
+                        tbody.appendChild(tr);
+                    });
+                }
+
+                // 全选/取消全选
+                selectAll.addEventListener('change', () => {
+                    const checkboxes = document.querySelectorAll('#historyTableBody input[type="checkbox"]');
+                    checkboxes.forEach(checkbox => checkbox.checked = selectAll.checked);
+                });
+
+                // 删除选中记录
+                deleteSelectedBtn.addEventListener('click', async () => {
+                    const selected = Array.from(document.querySelectorAll('#historyTableBody input[type="checkbox"]:checked'))
+                        .map(checkbox => checkbox.value);
+                    
+                    console.log('选中的记录ID:', selected);
+                    
+                    if (selected.length === 0) {
+                        alert('请先选择要删除的记录');
+                        return;
+                    }
+
+                    if (confirm(`确定要删除选中的 ${selected.length} 条记录吗？`)) {
+                        let successCount = 0;
+                        let errorMessage = '';
+                        
+                        try {
+                            // 创建一个进度指示器
+                            document.getElementById('syncStatus').textContent = '同步状态: 删除中...';
+                            
+                            console.log('开始批量删除处理，记录数:', selected.length);
+                            
+                            // 依次删除每条记录
+                            for (const id of selected) {
+                                try {
+                                    console.log('正在删除ID:', id, typeof id);
+                                    const result = await CloudService.deleteRecord(id);
+                                    console.log('删除结果:', result);
+                                    
+                                    if (result && result.success) {
+                                        successCount++;
+                                        console.log(`成功删除记录 ${id}, 进度: ${successCount}/${selected.length}`);
+                                    } else {
+                                        console.error('删除记录失败:', id, result ? result.error : '未知错误');
+                                        errorMessage += `ID: ${id} 删除失败\n`;
+                                    }
+                                    
+                                    // 添加短暂延迟，避免请求过于密集
+                                    await new Promise(resolve => setTimeout(resolve, 300));
+                                } catch (err) {
+                                    console.error('删除过程发生错误:', err);
+                                    errorMessage += `ID: ${id} 错误: ${err.message || '未知错误'}\n`;
+                                }
+                            }
+                            
+                            // 完成后更新状态
+                            document.getElementById('syncStatus').textContent = '同步状态: 已同步';
+                            
+                            if (successCount > 0) {
+                                // 更新本地记录列表
+                                console.log('更新本地记录列表，过滤掉已删除的记录');
+                            records = records.filter(r => !selected.includes(r.id));
+                                
+                                // 更新界面
+                                console.log('更新界面显示');
+                            updateHistoryTable(document.querySelector('.history-tab.active').dataset.type);
+                            updateInfoPanel();
+                            updateDailyChart();
+                            updateWeeklyChart();
+                                
+                                // 显示成功信息
+                                if (successCount === selected.length) {
+                                    alert(`成功删除所有 ${successCount} 条记录`);
+                                } else {
+                                    alert(`成功删除 ${successCount}/${selected.length} 条记录\n${errorMessage}`);
+                                }
+                            } else {
+                                alert(`删除失败: ${errorMessage}`);
+                            }
+                        } catch (error) {
+                            console.error('批量删除出错:', error);
+                            document.getElementById('syncStatus').textContent = '同步状态: 同步失败';
+                            alert('删除失败: ' + (error.message || '未知错误'));
+                        }
+                    }
+                });
+
+                // 导出Excel
+                exportBtn.addEventListener('click', () => {
+                    // 获取选中的记录ID
+                    const selected = Array.from(document.querySelectorAll('#historyTableBody input[type="checkbox"]:checked'))
+                        .map(checkbox => checkbox.value);
+                    
+                    // 如果没有选中任何记录，提示用户
+                    if (selected.length === 0) {
+                        alert('请先选择要导出的记录');
+                        return;
+                    }
+                    
+                    console.log('准备导出选中的记录:', selected);
+                    
+                    const type = document.querySelector('.history-tab.active').dataset.type;
+                    // 只过滤选中的记录
+                    const filteredRecords = records
+                        .filter(r => r.type === type && selected.includes(r.id))
+                        .sort((a, b) => new Date(b.time) - new Date(a.time));
+                    
+                    console.log('将导出以下记录:', filteredRecords);
+
+                    let csv = type === 'milk' ? 
+                        '时间,奶量(ml)\n' :
+                        '开始时间,结束时间,时长(分钟)\n';
+
+                    filteredRecords.forEach(record => {
+                        if (type === 'milk') {
+                            csv += `${new Date(record.time).toLocaleString()},${record.amount}\n`;
+                        } else {
+                            csv += `${new Date(record.start).toLocaleString()},${new Date(record.end).toLocaleString()},${record.duration}\n`;
+                        }
+                    });
+
+                    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                    const link = document.createElement('a');
+                    link.href = URL.createObjectURL(blob);
+                    link.download = `${type}_records_${new Date().toISOString().split('T')[0]}.csv`;
+                    link.click();
+                });
+
+                // 添加删除记录函数
+                window.deleteRecord = async function(id) {
+                    console.log('deleteRecord被调用，记录ID:', id, typeof id);
+                    if (confirm('确定要删除这条记录吗？')) {
+                        try {
+                            console.log('开始删除记录，ID:', id);
+                            const result = await CloudService.deleteRecord(id);
+                            console.log('删除结果:', result);
+                            
+                            if (result && result.success) {
+                                // 从本地记录中删除
+                                records = records.filter(r => r.id !== id);
+                                // 更新界面
+                                updateHistoryTable(document.querySelector('.history-tab.active').dataset.type);
+                                updateInfoPanel();
+                                updateDailyChart();
+                                updateWeeklyChart();
+                                alert('记录已成功删除');
+                            } else {
+                                alert('删除失败: ' + (result.error || '未知错误'));
+                            }
+                        } catch (error) {
+                            console.error('删除记录时出错:', error);
+                            alert('删除失败: ' + (error.message || '未知错误'));
+                        }
+                    }
+                };
+
+                // 添加点击空白处关闭设置面板
+                document.addEventListener('click', (e) => {
+                    if (!settings.contains(e.target) && e.target !== milkAdjustBtn) {
+                        settings.style.display = 'none';
+                    }
+                });
+
+                // 添加编辑记录函数和面板
+                window.editRecord = function(id) {
+                    console.log('编辑记录:', id);
+                    const record = records.find(r => r.id === id);
+                    if (!record) {
+                        console.error('找不到要编辑的记录:', id);
+                        alert('找不到要编辑的记录');
+                        return;
+                    }
+                    
+                    // 显示编辑面板
+                    const editPanel = document.getElementById('editPanel');
+                    const editTime = document.getElementById('editTime');
+                    const editAmountGroup = document.getElementById('editAmountGroup');
+                    const editSleepGroup = document.getElementById('editSleepGroup');
+                    const editAmount = document.getElementById('editAmount');
+                    const editSleepStart = document.getElementById('editSleepStart');
+                    const editSleepEnd = document.getElementById('editSleepEnd');
+                    
+                    // 设置当前编辑的记录ID
+                    editPanel.dataset.recordId = id;
+                    
+                    // 设置时间 - 修正为使用本地时区
+                    const recordTime = new Date(record.time);
+                    const timeString = formatLocalDateTime(recordTime);
+                    editTime.value = timeString;
+                    
+                    // 根据记录类型显示不同的编辑字段
+                    if (record.type === 'milk') {
+                        editAmountGroup.style.display = 'block';
+                        editSleepGroup.style.display = 'none';
+                        editAmount.value = record.amount;
+                    } else if (record.type === 'sleep') {
+                        editAmountGroup.style.display = 'none';
+                        editSleepGroup.style.display = 'block';
+                        
+                        // 设置睡眠开始和结束时间 - 修正为使用本地时区
+                        const startTime = new Date(record.start);
+                        const startTimeString = formatLocalDateTime(startTime);
+                        editSleepStart.value = startTimeString;
+                        
+                        if (record.end) {
+                            const endTime = new Date(record.end);
+                            const endTimeString = formatLocalDateTime(endTime);
+                            editSleepEnd.value = endTimeString;
+                        } else {
+                            editSleepEnd.value = '';
+                        }
+                    }
+                    
+                    editPanel.style.display = 'block';
+                };
+
+                // 辅助函数：格式化日期为本地时区的datetime-local输入所需格式 (YYYY-MM-DDTHH:MM)
+                function formatLocalDateTime(date) {
+                    const year = date.getFullYear();
+                    const month = String(date.getMonth() + 1).padStart(2, '0');
+                    const day = String(date.getDate()).padStart(2, '0');
+                    const hours = String(date.getHours()).padStart(2, '0');
+                    const minutes = String(date.getMinutes()).padStart(2, '0');
+                    
+                    return `${year}-${month}-${day}T${hours}:${minutes}`;
+                }
+                
+                // 保存编辑的记录
+                window.saveEditedRecord = async function() {
+                    try {
+                        const editPanel = document.getElementById('editPanel');
+                        const recordId = editPanel.dataset.recordId;
+                        console.log('正在保存编辑的记录ID:', recordId);
+                        
+                        const record = records.find(r => r.id === recordId);
+                        
+                        if (!record) {
+                            console.error('找不到要编辑的记录:', recordId);
+                            alert('找不到记录');
+                            return;
+                        }
+                        
+                        console.log('原始记录数据:', record);
+                        
+                        // 获取编辑后的值
+                        const editTime = document.getElementById('editTime');
+                        const editAmount = document.getElementById('editAmount');
+                        const editSleepStart = document.getElementById('editSleepStart');
+                        const editSleepEnd = document.getElementById('editSleepEnd');
+                        
+                        // 创建更新对象
+                        const updatedRecord = {
+                            id: recordId,
+                            type: record.type,
+                            time: new Date(editTime.value).toISOString(),
+                            babyId: currentBaby
+                        };
+                        
+                        if (record.type === 'milk') {
+                            updatedRecord.amount = parseInt(editAmount.value);
+                            
+                            if (!updatedRecord.amount || updatedRecord.amount < 1) {
+                                alert('请输入有效的奶量');
+                                return;
+                            }
+                        } else if (record.type === 'sleep') {
+                            const startTime = new Date(editSleepStart.value);
+                            const endTime = editSleepEnd.value ? new Date(editSleepEnd.value) : null;
+                            
+                            updatedRecord.start = startTime.toISOString();
+                            
+                            if (endTime) {
+                                if (endTime <= startTime) {
+                                    alert('睡眠结束时间必须晚于开始时间');
+                                    return;
+                                }
+                                
+                                updatedRecord.end = endTime.toISOString();
+                                // 计算睡眠时长（分钟）
+                                updatedRecord.duration = Math.round((endTime - startTime) / (1000 * 60));
+                            }
+                        }
+                        
+                        console.log('更新后的记录数据:', updatedRecord);
+                        
+                        // 调用API更新记录
+                        const result = await CloudService.updateRecord(updatedRecord);
+                        console.log('更新结果:', result);
+                        
+                        if (result.success) {
+                            // 更新本地记录
+                            const index = records.findIndex(r => r.id === recordId);
+                            if (index !== -1) {
+                                records[index] = { ...records[index], ...updatedRecord };
+                                console.log('本地记录已更新:', records[index]);
+                            }
+                            
+                            // 关闭编辑面板
+                            closeEditPanel();
+                            
+                            // 更新界面
+                            updateHistoryTable(document.querySelector('.history-tab.active').dataset.type);
+                            updateInfoPanel();
+                            updateDailyChart();
+                            updateWeeklyChart();
+                            
+                            alert('记录已更新');
+                        } else {
+                            alert('更新记录失败: ' + (result.error || '未知错误'));
+                        }
+                    } catch (error) {
+                        console.error('保存编辑记录出错:', error);
+                        alert('更新记录失败: ' + (error.message || '未知错误'));
+                    }
+                };
+                
+                // 关闭编辑面板
+                window.closeEditPanel = function() {
+                    document.getElementById('editPanel').style.display = 'none';
+                };
+
+                // 初始化按钮状态
+                sleepEndButton.style.opacity = '0.5';
+
+                // 获取宝宝月龄
+                function getBabyAgeInMonths(birthday) {
+                    const now = new Date();
+                    const birth = new Date(birthday);
+                    const months = (now.getFullYear() - birth.getFullYear()) * 12 + 
+                                 (now.getMonth() - birth.getMonth());
+                    return months;
+                }
+
+                // 获取基于年龄的推荐喂奶间隔（分钟）
+                function getRecommendedFeedingInterval(ageInMonths) {
+                    if (ageInMonths <= 3) {
+                        return 120; // 2小时
+                    } else if (ageInMonths <= 6) {
+                        return 180; // 3小时
+                    } else {
+                        return 240; // 4小时
+                    }
+                }
+
+                // 获取基于年龄的推荐睡眠时间（小时）
+                function getRecommendedSleepHours(ageInMonths) {
+                    if (ageInMonths <= 3) {
+                        return 15.5; // 14-17小时的中间值
+                    } else if (ageInMonths <= 11) {
+                        return 13.5; // 12-15小时的中间值
+                    } else if (ageInMonths <= 24) {
+                        return 12.5; // 11-14小时的中间值
+                    } else if (ageInMonths <= 36) {
+                        return 11.5; // 10-13小时的中间值
+                    } else {
+                        return 11.5; // 10-13小时的中间值
+                    }
+                }
+
+                // 获取喂奶智能提示
+                function getMilkTip(ageInMonths, timeSinceLastFeed) {
+                    const recommendedInterval = getRecommendedFeedingInterval(ageInMonths);
+                    const timeSinceLastFeedMinutes = Math.floor(timeSinceLastFeed / (1000 * 60));
+                    const timeSinceLastFeedHours = timeSinceLastFeedMinutes / 60;
+                    
+                    // 判断是否可能处于厌奶期
+                    const isPossibleFeedingStrike = (ageInMonths >= 4 && ageInMonths <= 6) || 
+                                                  (ageInMonths >= 8 && ageInMonths <= 10);
+
+                    if (timeSinceLastFeedMinutes < recommendedInterval * 0.5) {
+                        return "宝宝还不饿哦";
+                    } else if (timeSinceLastFeedMinutes >= recommendedInterval * 0.8 && 
+                             timeSinceLastFeedMinutes < recommendedInterval) {
+                        return "快到开心进食时间啦";
+                    } else if (timeSinceLastFeedHours >= 3.5 && timeSinceLastFeedHours <= 4.5) {
+                        if (isPossibleFeedingStrike) {
+                            return "宝宝可能在厌奶期，可以适当延长喂奶间隔哦！";
+                        } else {
+                            return "现在是比较适合的喂奶时间";
+                        }
+                    } else if (timeSinceLastFeedMinutes >= recommendedInterval && 
+                             timeSinceLastFeedMinutes < recommendedInterval * 1.2) {
+                        if (isPossibleFeedingStrike) {
+                            return "宝宝在厌奶期不要强迫哦，可以再等等";
+                        } else {
+                            return "开心进食时间到啦";
+                        }
+                    } else if (timeSinceLastFeedMinutes >= recommendedInterval * 1.5) {
+                        // 根据年龄段判断风险等级
+                        if (ageInMonths <= 3) {
+                            return "尽快进食，新生儿有低血糖风险";
+                        } else if (ageInMonths <= 6) {
+                            if (isPossibleFeedingStrike) {
+                                return "虽然在厌奶期，但间隔太长了，建议尝试少量多次";
+                            } else {
+                                return "间隔时间较长，建议尽快喂奶";
+                            }
+                        } else {
+                            return "间隔时间较长，建议适量进食";
+                        }
+                    } else {
+                        if (isPossibleFeedingStrike) {
+                            return "宝宝在厌奶期，可以观察饥饿信号再喂";
+                        } else {
+                            return "建议观察宝宝是否有进食意愿";
+                        }
+                    }
+                }
+
+                // 获取睡眠智能提示
+                function getSleepTip(ageInMonths, totalSleepHours) {
+                    const recommendedHours = getRecommendedSleepHours(ageInMonths);
+                    const diffHours = recommendedHours - totalSleepHours;
+                    
+                    // 获取该年龄段的最小推荐睡眠时间
+                    let minRecommendedHours;
+                    if (ageInMonths <= 3) {
+                        minRecommendedHours = 14; // 0-3个月最少14小时
+                    } else if (ageInMonths <= 11) {
+                        minRecommendedHours = 12; // 4-11个月最少12小时
+                    } else if (ageInMonths <= 24) {
+                        minRecommendedHours = 11; // 1-2岁最少11小时
+                    } else {
+                        minRecommendedHours = 10; // 2岁以上最少10小时
+                    }
+
+                    if (totalSleepHours < minRecommendedHours * 0.5) {
+                        // 睡眠严重不足
+                        return `宝宝睡眠严重不足，宝宝应该睡够${minRecommendedHours}个小时，还差${Math.round(minRecommendedHours - totalSleepHours)}个小时呢！`;
+                    } else if (totalSleepHours < minRecommendedHours) {
+                        // 睡眠不足
+                        return `宝宝睡眠不足哦，通常这个年龄的宝宝一天最少要睡够${minRecommendedHours}个小时`;
+                    } else if (totalSleepHours >= recommendedHours) {
+                        // 睡眠达标
+                        return "宝宝真棒，今日睡眠时长达标啦！";
+                    } else {
+                        // 接近达标
+                        const hoursToGo = Math.round(diffHours);
+                        if (hoursToGo <= 2) {
+                            return `宝宝还差${hoursToGo}个小时睡眠时长就达标啦！`;
+                        } else {
+                            return `宝宝睡眠时间还不够哦，建议再睡${hoursToGo}个小时`;
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('初始化失败:', error);
+                alert('应用初始化失败，请刷新页面重试');
+            }
+        });
+    </script>
+    <style>
+        :root {
+            --main: #8EC5D3; /* 奶噗噗蓝 */
+            --sub: #FFB6C1;  /* 睡呼呼粉 */
+            --accent: #D8BFD8; /* 醒来紫 */
+        }
+
+        body {
+            font-family: 'Microsoft YaHei', sans-serif;
+            max-width: 100%;
+            margin: 0 auto;
+            padding: 10px;
+            background: #f8f9fa;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 0 10px;
+            padding-top: 60px; /* 为顶部选择器留出空间 */
+        }
+
+        .action-btns {
+            display: flex;
+            justify-content: center;
+            margin: 25px 0 30px;
+            flex-wrap: wrap;
+            gap: 25px;
+        }
+
+        .action-btn {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: none;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s, background-color 0.3s;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            line-height: 1.4;
+            padding: 0;
+            position: relative;
+        }
+
+        @media (min-width: 768px) {
+            .action-btn {
+                width: 140px;
+                height: 140px;
+                font-size: 18px;
+            }
+        }
+
+        @media (max-width: 400px) {
+            .action-btn {
+                width: 110px;
+                height: 110px;
+                font-size: 15px;
+            }
+        }
+
+        .action-btn:active {
+            transform: scale(0.95);
+        }
+
+        #milkButton { 
+            background: var(--main); 
+            color: white; 
+        }
+        
+        .sleep-btn-container {
+            position: relative;
+            width: 120px;
+            height: 120px;
+        }
+        
+        @media (min-width: 768px) {
+            .sleep-btn-container {
+                width: 140px;
+                height: 140px;
+            }
+        }
+        
+        @media (max-width: 400px) {
+            .sleep-btn-container {
+                width: 110px;
+                height: 110px;
+            }
+        }
+        
+        #sleepStartButton, #sleepEndButton { 
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            transition: opacity 0.3s ease, transform 0.2s ease; /* 平滑过渡效果 */
+        }
+        
+        #sleepStartButton { 
+            background: var(--sub); 
+            color: white;
+            z-index: 2;
+            opacity: 1;
+        }
+        
+        #sleepEndButton { 
+            background: var(--accent); 
+            color: white;
+            z-index: 1;
+            opacity: 0;
+        }
+
+        .info-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 20px 0;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        .info-item {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .info-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .info-label {
+            font-weight: bold;
+            color: #555;
+            font-size: 15px;
+        }
+
+        .info-value {
+            font-size: 14px;
+            color: #666;
+        }
+
+        .progress-container {
+            position: relative;
+            height: 20px;
+            background: #f0f0f0;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            border-radius: 10px;
+            position: relative;
+            transition: width 0.3s ease;
+        }
+
+        .progress-bar.milk {
+            background: linear-gradient(90deg, #8EC5D3 0%, #B4E0EC 100%);
+        }
+
+        .progress-bar.sleep {
+            background: linear-gradient(90deg, #D8BFD8 0%, #E8D5E8 100%);
+        }
+
+        .progress-animation {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(90deg, 
+                rgba(255,255,255,0) 0%,
+                rgba(255,255,255,0.3) 50%,
+                rgba(255,255,255,0) 100%);
+            animation: progressLight 2s ease-in-out infinite;
+        }
+
+        @keyframes progressLight {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .smart-tip {
+            font-size: 13px;
+            padding: 5px 10px;
+            border-radius: 5px;
+            margin-top: 5px;
+            display: inline-block;
+        }
+
+        .smart-tip.milk {
+            background: rgba(142, 197, 211, 0.1);
+            color: #8EC5D3;
+        }
+
+        .smart-tip.sleep {
+            background: rgba(216, 191, 216, 0.1);
+            color: #D8BFD8;
+        }
+
+        .settings {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.2);
+            z-index: 100;
+            text-align: center;
+            width: 90%;
+            max-width: 300px;
+            display: none;
+        }
+
+        .chart-container {
+            background: white;
+            padding: 12px;
+            border-radius: 12px;
+            margin: 15px 0;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        .chart-tabs {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+            gap: 5px;
+        }
+
+        .chart-tab {
+            padding: 6px 12px;
+            border: none;
+            background: #eee;
+            cursor: pointer;
+            margin: 0 3px;
+            border-radius: 5px;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+
+        @media (min-width: 768px) {
+            .chart-tab {
+                padding: 8px 15px;
+                font-size: 14px;
+            }
+        }
+
+        .chart-tab.active {
+            background: var(--main);
+            color: white;
+        }
+
+        .milk-adjust {
+            text-align: center;
+            margin: 10px 0;
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .milk-adjust-btn, .history-btn {
+            background: var(--main);
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            min-width: 80px;
+        }
+
+        .history-panel {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: white;
+            z-index: 100;
+            padding: 15px;
+            display: none;
+            overflow-y: auto;
+        }
+
+        .history-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            position: sticky;
+            top: 0;
+            background: white;
+            padding: 10px 0;
+            z-index: 1;
+        }
+
+        .history-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #666;
+            padding: 5px 10px;
+        }
+
+        .history-tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+
+        .history-tab {
+            padding: 6px 12px;
+            border: none;
+            background: #eee;
+            cursor: pointer;
+            border-radius: 5px;
+            font-size: 13px;
+        }
+
+        .history-tab.active {
+            background: var(--main);
+            color: white;
+        }
+
+        .history-actions {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+
+        .history-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 15px;
+            font-size: 13px;
+        }
+
+        @media (min-width: 768px) {
+            .history-table {
+                font-size: 14px;
+            }
+        }
+
+        .history-table th, .history-table td {
+            padding: 8px;
+            border: 1px solid #eee;
+            text-align: left;
+        }
+
+        .history-table th {
+            background: #f8f9fa;
+            white-space: nowrap;
+        }
+
+        .history-table td {
+            word-break: break-word;
+        }
+
+        .history-table tr:hover {
+            background: #f8f9fa;
+        }
+
+        .checkbox-cell {
+            width: 30px;
+        }
+
+        .baby-selector {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: white;
+            padding: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            z-index: 90;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        @media (min-width: 768px) {
+            .baby-selector {
+                left: auto;
+                width: 300px;
+                border-radius: 0 0 0 10px;
+                box-shadow: -2px 2px 5px rgba(0,0,0,0.1);
+            }
+        }
+
+        .baby-selector .selector-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex: 1;
+        }
+
+        .baby-selector select {
+            padding: 8px;
+            border-radius: 5px;
+            border: 1px solid #ddd;
+            font-size: 14px;
+            flex: 1;
+            max-width: 200px;
+        }
+
+        #babyAge {
+            color: #666;
+            font-size: 13px;
+            margin-left: 10px;
+            white-space: nowrap;
+        }
+
+        .baby-selector button {
+            background: var(--main);
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            white-space: nowrap;
+        }
+
+        .baby-manager {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            padding: 15px;
+            border-radius: 12px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.2);
+            z-index: 110;
+            width: 90%;
+            max-width: 400px;
+            display: none;
+        }
+
+        .baby-list {
+            margin: 12px 0;
+            max-height: 50vh;
+            overflow-y: auto;
+        }
+
+        .baby-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px;
+            border-bottom: 1px solid #eee;
+            font-size: 14px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .baby-item:last-child {
+            border-bottom: none;
+        }
+
+        .login-panel {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: white;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 15px;
+        }
+
+        .login-form {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            width: 100%;
+            max-width: 300px;
+        }
+
+        .login-form input {
+            width: 100%;
+            padding: 10px;
+            margin: 8px 0;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            box-sizing: border-box;
+            font-size: 14px;
+        }
+
+        .login-form button {
+            width: 100%;
+            padding: 10px;
+            margin: 8px 0;
+            background: var(--main);
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 15px;
+        }
+
+        .login-form .switch-mode {
+            text-align: center;
+            color: var(--main);
+            cursor: pointer;
+            margin-top: 10px;
+            font-size: 14px;
+        }
+
+        .sync-status {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            color: #666;
+            z-index: 100;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        @media (max-width: 767px) {
+            .sync-status {
+                bottom: env(safe-area-inset-bottom, 10px);
+            }
+        }
+
+        h1 {
+            font-size: 22px;
+            margin: 10px 0 5px;
+            color: var(--main);
+            text-align: center;
+        }
+
+        @media (min-width: 768px) {
+            h1 {
+                font-size: 26px;
+                margin: 15px 0 8px;
+            }
+            
+            .container {
+                padding-top: 70px;
+            }
+        }
+
+        input[type="date"] {
+            font-size: 14px;
+            padding: 8px 12px;
+            border: 2px solid var(--main);
+            border-radius: 10px;
+            background-color: white;
+            color: #666;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            width: 140px;
+            font-family: 'Microsoft YaHei', sans-serif;
+        }
+
+        input[type="date"]::-webkit-calendar-picker-indicator {
+            background-color: var(--main);
+            padding: 5px;
+            cursor: pointer;
+            border-radius: 5px;
+            margin-left: 5px;
+            opacity: 0.8;
+            transition: opacity 0.3s ease;
+        }
+
+        input[type="date"]::-webkit-calendar-picker-indicator:hover {
+            opacity: 1;
+        }
+
+        input[type="date"]:focus {
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(142, 197, 211, 0.3);
+            border-color: var(--main);
+        }
+
+        input[type="date"]:hover {
+            border-color: #B4E0EC;
+        }
+
+        /* 日期选择框内部文字颜色 */
+        input[type="date"]::-webkit-datetime-edit {
+            color: #666;
+        }
+
+        /* 未选择日期时的占位符颜色 */
+        input[type="date"]::-webkit-datetime-edit-fields-wrapper {
+            color: #666;
+        }
+
+        input[type="date"]::-webkit-datetime-edit-text {
+            color: var(--main);
+            padding: 0 2px;
+        }
+
+        input[type="date"]::-webkit-datetime-edit-month-field,
+        input[type="date"]::-webkit-datetime-edit-day-field,
+        input[type="date"]::-webkit-datetime-edit-year-field {
+            color: #666;
+            transition: color 0.3s ease;
+        }
+
+        input[type="date"]:focus::-webkit-datetime-edit-month-field,
+        input[type="date"]:focus::-webkit-datetime-edit-day-field,
+        input[type="date"]:focus::-webkit-datetime-edit-year-field {
+            color: var(--main);
+        }
+
+        /* 添加一个可爱的悬浮效果 */
+        input[type="date"]:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(142, 197, 211, 0.2);
+        }
+
+        input[type="number"] {
+            font-size: 16px;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            width: 100px;
+        }
+
+        /* 安全区适配 */
+        @supports (padding-bottom: env(safe-area-inset-bottom)) {
+            body {
+                padding-bottom: env(safe-area-inset-bottom);
+            }
+        }
+
+        .checkbox-cell {
+            width: 30px;
+        }
+
+        .edit-panel {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.2);
+            z-index: 200;
+            width: 90%;
+            max-width: 350px;
+            display: none;
+        }
+
+        .edit-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .edit-form {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .form-group label {
+            font-weight: bold;
+            color: #555;
+        }
+
+        .form-group input {
+            padding: 8px;
+            border-radius: 5px;
+            border: 1px solid #ddd;
+            font-size: 14px;
+        }
+
+        .form-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        /* 日期选择下拉面板的样式 */
+        ::-webkit-calendar-picker-indicator {
+            background-image: none;
+            position: relative;
+            cursor: pointer;
+        }
+
+        ::-webkit-calendar-picker-indicator::after {
+            content: '📅';
+            font-size: 16px;
+            color: var(--main);
+        }
+
+        /* 自定义日期选择面板样式 */
+        input[type="date"]::-webkit-calendar-picker {
+            background-color: white;
+            border: 2px solid var(--main);
+            border-radius: 15px;
+            box-shadow: 0 4px 12px rgba(142, 197, 211, 0.2);
+            padding: 10px;
+            color: #666;
+        }
+
+        /* 日期选择面板的头部 */
+        ::-webkit-datetime-edit {
+            padding: 0 5px;
+        }
+
+        /* 自定义日期选择器样式 */
+        input[type="date"]::-webkit-inner-spin-button,
+        input[type="date"]::-webkit-clear-button {
+            display: none;
+        }
+
+        /* 覆盖默认的日期选择器样式 */
+        input[type="date"] {
+            position: relative;
+            background: white;
+        }
+
+        /* 添加自定义样式到日期选择面板 */
+        input[type="date"]::before {
+            background-color: white;
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 4px 12px rgba(142, 197, 211, 0.2);
+        }
+
+        /* 日期选择面板中的日期样式 */
+        .calendar-day {
+            color: #666;
+            border-radius: 50%;
+            transition: all 0.3s ease;
+        }
+
+        .calendar-day:hover {
+            background-color: rgba(142, 197, 211, 0.2);
+            color: var(--main);
+        }
+
+        .calendar-day.selected {
+            background-color: var(--main);
+            color: white;
+        }
+
+        /* 日期选择面板的月份和年份选择器 */
+        .calendar-nav {
+            background-color: var(--main);
+            color: white;
+            border-radius: 10px 10px 0 0;
+            padding: 10px;
+        }
+
+        /* 添加自定义样式到日期输入框 */
+        input[type="date"] {
+            appearance: none;
+            -webkit-appearance: none;
+            background-color: white;
+            padding: 8px 12px;
+            border: 2px solid var(--main);
+            border-radius: 10px;
+            font-family: 'Microsoft YaHei', sans-serif;
+            color: #666;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        /* 日期选择器的下拉箭头 */
+        input[type="date"]::-webkit-calendar-picker-indicator {
+            opacity: 1;
+            display: block;
+            width: 20px;
+            height: 20px;
+            border-width: 0;
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            cursor: pointer;
+        }
+
+        /* 添加悬浮效果 */
+        input[type="date"]:hover {
+            border-color: #B4E0EC;
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(142, 197, 211, 0.2);
+        }
+
+        /* 添加焦点效果 */
+        input[type="date"]:focus {
+            outline: none;
+            border-color: var(--main);
+            box-shadow: 0 0 0 3px rgba(142, 197, 211, 0.3);
+        }
+
+        /* 自定义日期选择面板的样式 */
+        ::-webkit-datetime-edit-fields-wrapper {
+            padding: 0;
+        }
+
+        ::-webkit-datetime-edit-text {
+            color: var(--main);
+            padding: 0 2px;
+        }
+
+        ::-webkit-datetime-edit-month-field,
+        ::-webkit-datetime-edit-day-field,
+        ::-webkit-datetime-edit-year-field {
+            color: #666;
+            transition: color 0.3s ease;
+        }
+
+        input[type="date"]:focus::-webkit-datetime-edit-month-field,
+        input[type="date"]:focus::-webkit-datetime-edit-day-field,
+        input[type="date"]:focus::-webkit-datetime-edit-year-field {
+            color: var(--main);
+        }
+
+        /* 日期选择面板的整体容器 */
+        .date-picker-container {
+            background: white;
+            border: 2px solid var(--main);
+            border-radius: 15px;
+            box-shadow: 0 4px 12px rgba(142, 197, 211, 0.2);
+            overflow: hidden;
+        }
+
+        /* 日期选择面板的头部 */
+        .date-picker-header {
+            background: var(--main);
+            color: white;
+            padding: 10px;
+            text-align: center;
+            font-weight: bold;
+        }
+
+        /* 日期选择面板的主体 */
+        .date-picker-body {
+            padding: 10px;
+        }
+
+        /* 日期单元格 */
+        .date-cell {
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .date-cell:hover {
+            background: rgba(142, 197, 211, 0.2);
+            color: var(--main);
+        }
+
+        .date-cell.selected {
+            background: var(--main);
+            color: white;
+        }
+
+        .date-cell.today {
+            border: 2px solid var(--main);
+            color: var(--main);
+        }
+
+        /* 月份和年份选择器 */
+        .month-year-selector {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 5px 10px;
+            background: var(--main);
+            color: white;
+        }
+
+        .month-year-selector select {
+            background: transparent;
+            border: none;
+            color: white;
+            cursor: pointer;
+        }
+
+        .month-year-selector select:focus {
+            outline: none;
+        }
+
+        /* 周末日期的特殊样式 */
+        .weekend {
+            color: var(--sub);
+        }
+
+        /* 不可选择日期的样式 */
+        .disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* 清除和今天按钮的样式 */
+        .date-picker-footer {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px;
+            border-top: 1px solid rgba(142, 197, 211, 0.2);
+        }
+
+        .date-picker-footer button {
+            background: none;
+            border: none;
+            color: var(--main);
+            cursor: pointer;
+            padding: 5px 10px;
+            border-radius: 5px;
+            transition: all 0.3s ease;
+        }
+
+        .date-picker-footer button:hover {
+            background: rgba(142, 197, 211, 0.2);
+        }
+
+        /* 宝宝管理界面布局 */
+        .baby-management {
+            padding: 20px;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .baby-management h2 {
+            color: var(--main);
+            margin-bottom: 20px;
+            text-align: center;
+        }
+
+        /* 输入区域布局 */
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            align-items: center;
+        }
+
+        /* 名字输入框和日期选择框样式 */
+        .input-group input[type="text"],
+        .input-group input[type="date"] {
+            flex: 1;
+            min-width: 0; /* 防止flex子项溢出 */
+            height: 40px;
+            padding: 8px 12px;
+            border: 2px solid var(--main);
+            border-radius: 10px;
+            font-size: 14px;
+            color: #666;
+        }
+
+        /* 添加宝宝按钮样式 */
+        .add-baby-btn {
+            background: var(--main);
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            white-space: nowrap; /* 防止按钮文字换行 */
+        }
+
+        .add-baby-btn:hover {
+            background: #B4E0EC;
+            transform: translateY(-1px);
+        }
+
+        /* 宝宝列表样式 */
+        .baby-list {
+            margin-top: 20px;
+        }
+
+        .baby-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            margin-bottom: 10px;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+
+        /* 响应式调整 */
+        @media (max-width: 480px) {
+            .input-group {
+                flex-wrap: nowrap; /* 防止换行 */
+            }
+
+            .input-group input[type="text"],
+            .input-group input[type="date"] {
+                font-size: 13px; /* 稍微减小字体大小 */
+                padding: 8px; /* 减小内边距 */
+            }
+
+            .add-baby-btn {
+                padding: 8px 12px;
+                font-size: 13px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="login-panel" id="loginPanel">
+        <div class="login-form">
+            <h2 style="text-align:center;color:var(--main);margin-bottom:20px">奶呼呼</h2>
+            <input type="text" id="username" placeholder="用户名">
+            <input type="password" id="password" placeholder="密码">
+            <button id="loginBtn">登录</button>
+            <div class="switch-mode" id="switchMode">还没有账号？点击注册</div>
+        </div>
+    </div>
+
+    <div class="sync-status" id="syncStatus">同步状态: 已同步</div>
+
+    <div class="baby-selector">
+        <div class="selector-row">
+            <select id="babySelect"></select>
+            <button id="manageBabiesBtn">管理宝宝</button>
+        </div>
+        <div id="babyAge" style="color: #666; font-size: 12px; text-align: center;">--</div>
+    </div>
+
+    <div class="baby-manager" id="babyManager">
+        <h3 style="color:var(--main);margin-top:0">宝宝管理</h3>
+        <div style="margin-bottom: 15px;">
+            <input type="text" id="newBabyName" placeholder="输入宝宝名字" style="padding:8px 12px;margin-right:10px;border:2px solid var(--main);border-radius:10px;font-size:14px;">
+            <input type="date" id="newBabyBirthday">
+            <button onclick="addBaby()" class="milk-adjust-btn" style="margin-left:10px">添加宝宝</button>
+        </div>
+        <div class="baby-list" id="babyList"></div>
+        <div style="display: flex; justify-content: space-between; margin-top: 15px;">
+            <button onclick="closeBabyManager()" class="milk-adjust-btn">关闭</button>
+            <button onclick="logout()" class="milk-adjust-btn" style="background: #ff6b6b;">退出登录</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <h1 style="color:var(--main);text-align:center;margin-bottom:0">奶呼呼</h1>
+        <p style="text-align:center;color:#666;margin-top:5px">吃奶睡觉，一键记好</p>
+        
+        <div class="action-btns">
+            <button class="action-btn" id="milkButton">🍼<br>吃奶</button>
+            <div class="sleep-btn-container">
+            <button class="action-btn" id="sleepStartButton">😴<br>入睡</button>
+            <button class="action-btn" id="sleepEndButton">😃<br>睡醒</button>
+            </div>
+        </div>
+
+        <div class="milk-adjust">
+            <button id="milkAdjustBtn" class="milk-adjust-btn">奶量修改</button>
+            <button id="historyBtn" class="history-btn">历史记录</button>
+        </div>
+
+        <div class="info-panel">
+            <div class="info-item">
+                <div class="info-header">
+                    <span class="info-label">吃奶间隔时间</span>
+                    <span class="info-value" id="lastMilkTime">--</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar milk" id="milkProgress">
+                        <div class="progress-animation"></div>
+                    </div>
+                </div>
+                <div class="smart-tip milk" id="milkTip">--</div>
+            </div>
+            <div class="info-item">
+                <div class="info-header">
+                    <span class="info-label">今日睡眠时间</span>
+                    <span class="info-value" id="todaySleepTime">--</span>
+                </div>
+                <div class="progress-container">
+                    <div class="progress-bar sleep" id="sleepProgress">
+                        <div class="progress-animation"></div>
+                    </div>
+                </div>
+                <div class="smart-tip sleep" id="sleepTip">--</div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <div class="chart-tabs">
+                <button class="chart-tab active" id="dailyChartTab">今日喂奶记录</button>
+                <button class="chart-tab" id="weeklyMilkTab">一周奶量</button>
+                <button class="chart-tab" id="weeklySleepTab">一周睡眠</button>
+            </div>
+            <canvas id="dailyChart"></canvas>
+            <canvas id="weeklyMilkChart" style="display:none"></canvas>
+            <canvas id="weeklySleepChart" style="display:none"></canvas>
+        </div>
+    </div>
+
+    <div class="settings" id="settings">
+        <h3 style="color:var(--main)">设置单次奶量（ml）</h3>
+        <input type="number" id="milkAmount" min="10" style="font-size:18px;padding:5px;margin:10px">
+        <button id="saveSettingsBtn" style="background:var(--main);color:white;border:none;padding:8px 20px;border-radius:15px;cursor:pointer">
+            保存设置
+        </button>
+    </div>
+
+    <div class="history-panel" id="historyPanel">
+        <div class="history-header">
+            <h2>历史记录</h2>
+            <button class="history-close" id="historyClose">×</button>
+        </div>
+        <div class="history-tabs">
+            <button class="history-tab active" data-type="milk">喂奶记录</button>
+            <button class="history-tab" data-type="sleep">睡眠记录</button>
+        </div>
+        <div class="history-actions">
+            <button class="milk-adjust-btn" id="exportBtn">导出Excel</button>
+            <button class="milk-adjust-btn" id="deleteSelectedBtn">删除选中</button>
+        </div>
+        <table class="history-table">
+            <thead>
+                <tr>
+                    <th class="checkbox-cell"><input type="checkbox" id="selectAll"></th>
+                    <th>时间</th>
+                    <th>数据</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody id="historyTableBody">
+            </tbody>
+        </table>
+    </div>
+
+    <!-- 编辑记录面板 -->
+    <div class="edit-panel" id="editPanel">
+        <div class="edit-header">
+            <h2>编辑记录</h2>
+            <button class="history-close" onclick="closeEditPanel()">×</button>
+        </div>
+        <div class="edit-form">
+            <div class="form-group">
+                <label for="editTime">时间:</label>
+                <input type="datetime-local" id="editTime">
+            </div>
+            <div class="form-group" id="editAmountGroup">
+                <label for="editAmount">奶量 (ml):</label>
+                <input type="number" id="editAmount" min="1" step="1">
+            </div>
+            <div class="form-group" id="editSleepGroup">
+                <label for="editSleepStart">入睡时间:</label>
+                <input type="datetime-local" id="editSleepStart">
+                <label for="editSleepEnd">醒来时间:</label>
+                <input type="datetime-local" id="editSleepEnd">
+            </div>
+            <div class="form-actions">
+                <button class="milk-adjust-btn" onclick="saveEditedRecord()">保存</button>
+                <button class="milk-adjust-btn" onclick="closeEditPanel()" style="background: #ccc;">取消</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
